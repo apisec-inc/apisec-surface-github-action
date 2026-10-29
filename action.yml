@@ -1,0 +1,156 @@
+name: 'APIsec Surface'
+description: 'Discover the APIs in your code with APIsec Surface and send them to APIsec'
+author: 'APIsec'
+
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+inputs:
+  apisec-pat:
+    description: 'APIsec personal access token. Required unless dry-run.'
+    required: false
+    default: ''
+  registration-code:
+    description: 'APIsec registration code for the applications this creates'
+    required: false
+    default: 'ci-github-action'
+  api-url:
+    description: 'APIsec API URL'
+    required: false
+    default: 'https://api.apisecapps.com'
+  path:
+    description: 'Path to the code to analyze'
+    required: false
+    default: '.'
+  dry-run:
+    description: 'true analyzes without uploading. Default: true on pull requests, false otherwise.'
+    required: false
+    default: ''
+  cli-version:
+    description: 'Surface CLI version to install. Default: newest 1.x.'
+    required: false
+    default: ''
+  fail-on-error:
+    description: 'false keeps the job green when the scan or upload fails'
+    required: false
+    default: 'true'
+
+outputs:
+  endpoints-count:
+    description: 'Number of API routes found'
+    value: ${{ steps.surface.outputs.endpoints-count }}
+  frameworks-detected:
+    description: 'Comma-separated list of detected frameworks'
+    value: ${{ steps.surface.outputs.frameworks-detected }}
+  application-id:
+    description: 'APIsec application id (empty on dry runs)'
+    value: ${{ steps.surface.outputs.application-id }}
+  success:
+    description: 'true when the scan (and upload, unless dry-run) succeeded'
+    value: ${{ steps.surface.outputs.success }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v7
+      with:
+        python-version: '3.11'
+
+    - name: Install Surface CLI
+      shell: bash
+      env:
+        CLI_VERSION: ${{ inputs.cli-version }}
+      run: |
+        # 2.x may change the analyze interface, so it waits for a new major of this action.
+        if [ -n "$CLI_VERSION" ]; then
+          SPEC="apisec-surface==$CLI_VERSION"
+        else
+          SPEC="apisec-surface>=1.2,<2"
+        fi
+        python -m pip install --quiet --upgrade pip
+        python -m pip install --quiet "$SPEC"
+        apisec-surface --version
+        apisec-surface telemetry off || true
+
+    - name: Run Surface
+      id: surface
+      shell: bash
+      env:
+        APISEC_PAT: ${{ inputs.apisec-pat }}
+        APISEC_REGISTRATION_CODE: ${{ inputs.registration-code }}
+        API_URL: ${{ inputs.api-url }}
+        SCAN_PATH: ${{ inputs.path }}
+        DRY_RUN: ${{ inputs.dry-run }}
+        FAIL_ON_ERROR: ${{ inputs.fail-on-error }}
+        EVENT_NAME: ${{ github.event_name }}
+      run: |
+        if [ -z "$DRY_RUN" ]; then
+          case "$EVENT_NAME" in
+            pull_request|pull_request_target) DRY_RUN=true ;;
+            *) DRY_RUN=false ;;
+          esac
+        fi
+        if [ "$DRY_RUN" != "true" ] && [ -z "$APISEC_PAT" ]; then
+          echo "::error title=APIsec Surface::Set the apisec-pat input (an APIsec personal access token), or run with dry-run: true."
+          exit 1
+        fi
+
+        # Surface identifies the repo from GITHUB_REPOSITORY, so repeat runs update the same application.
+        ARGS=(--log-format json analyze "$SCAN_PATH" --api-url "$API_URL")
+        if [ "$DRY_RUN" = "true" ]; then
+          ARGS+=(--dry-run)
+        fi
+        set +e
+        apisec-surface "${ARGS[@]}" 2>surface.ndjson
+        RC=$?
+        set -e
+        cat surface.ndjson >&2
+
+        RC="$RC" DRY_RUN="$DRY_RUN" python - <<'PY'
+        import json
+        import os
+        from pathlib import Path
+
+        routes = frameworks = ""
+        log = Path("surface.ndjson")
+        if log.exists():
+            for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(record, dict) and record.get("event") == "scan_complete":
+                    routes = str(record.get("routes_found", ""))
+                    frameworks = ",".join(record.get("frameworks") or [])
+
+        app_id = ""
+        state = Path(os.environ["SCAN_PATH"]) / "apisec-code-bolt" / "state.yaml"
+        if os.environ["DRY_RUN"] != "true" and state.exists():
+            for line in state.read_text(encoding="utf-8", errors="replace").splitlines():
+                if line.startswith("applicationId:"):
+                    app_id = line.split(":", 1)[1].strip().strip("\"'")
+                    break
+
+        with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+            out.write(f"endpoints-count={routes}\n")
+            out.write(f"frameworks-detected={frameworks}\n")
+            out.write(f"application-id={app_id}\n")
+            out.write(f"success={'true' if os.environ['RC'] == '0' else 'false'}\n")
+        PY
+        rm -f surface.ndjson
+
+        if [ "$RC" != "0" ]; then
+          if [ "$DRY_RUN" = "true" ]; then
+            MSG="Surface analysis failed (exit code $RC). See the step log."
+          else
+            MSG="Surface scan or upload failed (exit code $RC); results were not sent to APIsec. See the step log."
+          fi
+          if [ "$FAIL_ON_ERROR" = "false" ]; then
+            echo "::warning title=APIsec Surface::$MSG"
+          else
+            echo "::error title=APIsec Surface::$MSG"
+            exit "$RC"
+          fi
+        fi
